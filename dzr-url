@@ -4,7 +4,10 @@
 
 SNG_IDS=$(printf "%s" "$*" | sed 's/ /,/g')
 FETCH=${FETCH:-curl -s} # FETCH="wget -q -O -" or FETCH="curl -s -k"
-die() { echo "$1" >&2; exit 1; }
+die() { echo "$1" >&2; exit "${2:-1}"; }
+# exit code 3 specifically signals a stale/expired Deezer session (sid/token) so callers
+# (e.g. dzr) can react by rebuilding the session instead of treating it as a generic error.
+stale() { die "error: Deezer session expired or invalid (stale sid/token); re-login or restart dzr" 3; }
 gw () {
   method="$1"; session="$2" ;apiToken="$3" ; shift 3 # curl args ...
   $FETCH "https://www.deezer.com/ajax/gw-light.php?method=$method&input=3&api_version=1.0&api_token=$apiToken" --header "Cookie: sid=$session; arl=$DZR_ARL" "$@"
@@ -21,12 +24,16 @@ else
 	USR_NFO=$(gw deezer.getUserData "$DZR_SID" "$API_TOK")
 	USR_LIC=$(printf "%s" "$USR_NFO" | jq -r .results.USER.OPTIONS.license_token)
 	API_TOK=$(printf "%s" "$USR_NFO" | jq -r .results.checkForm)
-	[ -z "$USR_LIC" ] || [ "$USR_LIC" = "null" ] && die "error: getUserData failed (no license token)"
-	[ -z "$API_TOK" ] || [ "$API_TOK" = "null" ] && die "error: getUserData failed (no api token)"
+	{ [ -z "$USR_LIC" ] || [ "$USR_LIC" = "null" ]; } && stale # expired/invalid ARL -> anonymous session
+	{ [ -z "$API_TOK" ] || [ "$API_TOK" = "null" ]; } && stale
 fi
 
 SNG_NFO=$(gw song.getListData "$DZR_SID" "$API_TOK" --data "{\"sng_ids\":[$SNG_IDS]}")
-printf "%s" "$SNG_NFO" | jq -e '.results.data // empty' >/dev/null 2>&1 || die "error: song.getListData returned no data"
+# A stale session makes gw-light return an error object (e.g. VALID_TOKEN_REQUIRED) or an
+# empty/null data set; surface that as a distinct stale-session failure instead of a generic
+# "no data" so the caller can refresh the session (and so we never iterate over null below).
+printf "%s" "$SNG_NFO" | jq -e '(.error|type=="object" and (.|length>0))' >/dev/null 2>&1 && stale
+printf "%s" "$SNG_NFO" | jq -e '.results.data // empty' >/dev/null 2>&1 || stale
 SNG_TOK=$(printf "%s" "$SNG_NFO" | jq '[.results.data[]|(.FALLBACK.TRACK_TOKEN//.TRACK_TOKEN)]')
 # reset to resolvable id, eg:no personal uploads (geoblocked track will fail later)
 SNG_IDS=$(printf "%s" "$SNG_NFO" | jq '[.results.data[]|(.FALLBACK.SNG_ID//.SNG_ID)]')

@@ -12,7 +12,8 @@ if [ "$REQUEST_METHOD" = "HEAD" ] ; then
 	printf 'Access-Control-Allow-Origin: *\ndzr-api: 0\n\n'
 elif [ "$REQUEST_METHOD" = "GET" ] ; then
 	printf "Cache-Control: max-age=31536000, immutable\nContent-Type: audio/mpeg\n\n"
-	echo "$QUERY_STRING" | xargs basename | xargs $0-url | while IFS= read -r line; do
+	CGI_IDS=$(echo "$QUERY_STRING" | xargs basename 2>/dev/null)
+	[ -n "$CGI_IDS" ] && printf '%s\n' "$CGI_IDS" | xargs $0-url | while IFS= read -r line; do
 		url=$(printf '%s\n' "$line" | cut -f1)
 		id=$(printf '%s\n' "$line" | cut -f2)
 		$FETCH "$url" | $DZR_SPONGE | $0-dec $id
@@ -66,23 +67,45 @@ done
 # fetch user info via gw-light API
 export GW="https://www.deezer.com/ajax/gw-light.php"
 gw() { $FETCH "$GW?method=$1&input=3&api_version=1.0&api_token=$DZR_API_TOK" --header "Cookie: sid=$DZR_SID; arl=$DZR_ARL" ${2:+-d "$2"}; }
-# Build the gw-light session from the ARL, validating that it actually authenticates.
-# A USER_ID of 0/null/empty means the ARL is missing, expired or invalid: Deezer falls
-# back to an anonymous session which cannot play, leading to confusing downstream errors
-# (e.g. "song.getListData returned no data"). In that case we re-prompt for a fresh ARL.
-while [ -z "$DZR_SID" ]; do
-	export DZR_SID=$($FETCH "www.deezer.com/ajax/gw-light.php?method=deezer.ping&api_version=1.0&api_token" | jq -r .results.SESSION)
-	_DZR_USR=$(DZR_API_TOK= gw deezer.getUserData '{}')
-	export DZR_LOVED=$(printf "%s" "$_DZR_USR" | jq -r .results.USER.LOVEDTRACKS_ID)
-	export DZR_USER_ID=$(printf "%s" "$_DZR_USR" | jq -r .results.USER.USER_ID)
-	export DZR_API_TOK=$(printf "%s" "$_DZR_USR" | jq -r .results.checkForm)
-	export DZR_LIC=$(printf "%s" "$_DZR_USR" | jq -r .results.USER.OPTIONS.license_token)
-	case "$DZR_USER_ID" in
+# build_session: (re)build the gw-light session from the ARL, validating that it actually
+# authenticates. A USER_ID of 0/null/empty means the ARL is missing, expired or invalid:
+# Deezer falls back to an anonymous session which cannot play, leading to confusing
+# downstream errors (e.g. "song.getListData returned no data"). In that case we re-prompt
+# for a fresh ARL. Used both at startup and to refresh a stale session during playback.
+build_session() {
+	DZR_SID= # force a fresh ping
+	while [ -z "$DZR_SID" ]; do
+		export DZR_SID=$($FETCH "www.deezer.com/ajax/gw-light.php?method=deezer.ping&api_version=1.0&api_token" | jq -r .results.SESSION)
+		_DZR_USR=$(DZR_API_TOK= gw deezer.getUserData '{}')
+		export DZR_LOVED=$(printf "%s" "$_DZR_USR" | jq -r .results.USER.LOVEDTRACKS_ID)
+		export DZR_USER_ID=$(printf "%s" "$_DZR_USR" | jq -r .results.USER.USER_ID)
+		export DZR_API_TOK=$(printf "%s" "$_DZR_USR" | jq -r .results.checkForm)
+		export DZR_LIC=$(printf "%s" "$_DZR_USR" | jq -r .results.USER.OPTIONS.license_token)
+		case "$DZR_USER_ID" in
+		''|null|0)
+			prompt_arl "Your Deezer session (ARL) has expired or is invalid, so playback is not possible. Please log in again."
+			;;
+		esac
+	done
+}
+# ensure_session: cheaply verify the current session is still valid before using it, and
+# rebuild it if not. The gw-light "sid" expires server-side after ~1 day, so a long-running
+# dzr process would otherwise keep reusing a dead session, producing empty audio and an
+# endless error loop. One lightweight getUserData call per playback batch is enough: if it
+# comes back anonymous (USER_ID 0/null) or without a checkForm token, the session is stale.
+ensure_session() {
+	_DZR_USR=$(gw deezer.getUserData '{}')
+	_DZR_UID=$(printf "%s" "$_DZR_USR" | jq -r .results.USER.USER_ID)
+	_DZR_TOK=$(printf "%s" "$_DZR_USR" | jq -r .results.checkForm)
+	case "$_DZR_UID" in
 	''|null|0)
-		prompt_arl "Your Deezer session (ARL) has expired or is invalid, so playback is not possible. Please log in again."
-		;;
+		echo "dzr: session expired, refreshing..." >&2
+		build_session ;;
+	*)
+		[ -z "$_DZR_TOK" ] || [ "$_DZR_TOK" = "null" ] && { echo "dzr: session token stale, refreshing..." >&2; build_session; } ;;
 	esac
-done
+}
+[ -z "$DZR_SID" ] && build_session
 
 # main
 trap 'printf "\033]0;\007" >&2' EXIT
@@ -181,7 +204,9 @@ dzr_playlist_0()       { gw_playlist "$1" | jq "$GW_FMT_LIST" | xargs $DLG_LIST 
 
 
 play() { # receive /track/1,2,3 from stdin
-	xargs basename | xargs $SELF-url | ${1:-cat} | while IFS= read -r line; do
+	IDS=$(xargs basename 2>/dev/null)
+	[ -z "$IDS" ] && { echo "dzr: nothing to play" >&2; return 0; }
+	printf '%s\n' "$IDS" | xargs $SELF-url | ${1:-cat} | while IFS= read -r line; do
 		printf '%s\n' "$line" | grep -q '	' || { echo "error: unexpected dzr-url output: $line" >&2; break; }
 		url=$(printf '%s\n' "$line" | cut -f1)
 		id=$(printf '%s\n' "$line" | cut -f2)
@@ -195,6 +220,7 @@ play() { # receive /track/1,2,3 from stdin
 }
 # play_all: call the gw fetcher for this context, extract track IDs, play
 play_all() { # $1=url $2=FUNC $3=order(cat|shuf)
+	ensure_session # refresh a stale (e.g. day-old) session before fetching/playing
 	case "$2" in
 	dzr_flow)           gw_flow ;;
 	dzr_loved)          gw_loved ;;
@@ -209,7 +235,7 @@ play_all() { # $1=url $2=FUNC $3=order(cat|shuf)
 }
 for url in "$@"; do
 	case $url in
-		/track/*) echo $url | play; continue ;; # direct play
+		/track/*) ensure_session; echo $url | play; continue ;; # direct play
 	esac
 
 	FUNC=$(echo "dzr_$url" | sed "$FMT_FUNC") # path (/search/artist?q=x) to function (dzr_search_artist)
@@ -224,7 +250,7 @@ for url in "$@"; do
 		case "$path" in
 		▸) play_all "$url" "$FUNC" cat; break ;;
 		⇄) play_all "$url" "$FUNC" shuf; break ;;
-		∞) while true; do gw_flow | jq "$GW_FMT_TRKS" | play cat || break; done; break ;;
+		∞) while true; do ensure_session; gw_flow | jq "$GW_FMT_TRKS" | play cat || break; done; break ;;
 		/*) $SELF "$path";;
 		*)  $SELF "$url/$path";;
 		esac
