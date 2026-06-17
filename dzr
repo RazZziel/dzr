@@ -88,22 +88,30 @@ build_session() {
 		esac
 	done
 }
-# ensure_session: cheaply verify the current session is still valid before using it, and
-# rebuild it if not. The gw-light "sid" expires server-side after ~1 day, so a long-running
-# dzr process would otherwise keep reusing a dead session, producing empty audio and an
-# endless error loop. One lightweight getUserData call per playback batch is enough: if it
-# comes back anonymous (USER_ID 0/null) or without a checkForm token, the session is stale.
-ensure_session() {
-	_DZR_USR=$(gw deezer.getUserData '{}')
-	_DZR_UID=$(printf "%s" "$_DZR_USR" | jq -r .results.USER.USER_ID)
-	_DZR_TOK=$(printf "%s" "$_DZR_USR" | jq -r .results.checkForm)
-	case "$_DZR_UID" in
-	''|null|0)
+# gw_stale: true (0) if a gw-light response looks like a dead/expired session.
+# The gw "sid" expires server-side after ~1 day; a long-running dzr would otherwise keep
+# reusing a dead session, getting null .results.data (-> "jq: Cannot iterate over null")
+# and producing empty audio in an endless loop. A getUserData probe is unreliable (it can
+# still succeed while content calls fail), so we judge staleness from the actual response.
+gw_stale() { # $1=json
+	printf "%s" "$1" | jq -e '
+		(.error|type=="object" and (.|length>0))
+		or ((.results|type=="object") and (.results.data==null) and (.results|has("data")))
+		or (.results==null) or (.results=="")
+	' >/dev/null 2>&1
+}
+# gw_data: fetch via a gw-light fetcher ("$@") into the global GW_OUT, rebuilding the
+# session and retrying once if the response looks stale. Result is returned in $GW_OUT
+# (NOT stdout) and the rebuild runs in the *current* shell, so build_session's exports
+# (DZR_SID/DZR_API_TOK/DZR_LIC) persist for the subsequent pipeline and the child dzr-url.
+# Call it as a plain command (gw_data fetcher ...), never inside $() or a pipe.
+gw_data() { # usage: gw_data fetcher [args...]; then use "$GW_OUT"
+	GW_OUT=$("$@")
+	if gw_stale "$GW_OUT"; then
 		echo "dzr: session expired, refreshing..." >&2
-		build_session ;;
-	*)
-		[ -z "$_DZR_TOK" ] || [ "$_DZR_TOK" = "null" ] && { echo "dzr: session token stale, refreshing..." >&2; build_session; } ;;
-	esac
+		build_session
+		GW_OUT=$("$@")
+	fi
 }
 [ -z "$DZR_SID" ] && build_session
 
@@ -205,8 +213,15 @@ dzr_playlist_0()       { gw_playlist "$1" | jq "$GW_FMT_LIST" | xargs $DLG_LIST 
 
 play() { # receive /track/1,2,3 from stdin
 	IDS=$(xargs basename 2>/dev/null)
-	[ -z "$IDS" ] && { echo "dzr: nothing to play" >&2; return 0; }
-	printf '%s\n' "$IDS" | xargs $SELF-url | ${1:-cat} | while IFS= read -r line; do
+	# require a comma-separated list of numeric IDs; an empty track list (e.g. "/track/"
+	# from an exhausted/empty Flow, or "track") must stop the caller, not feed dzr-url junk
+	echo "$IDS" | grep -Eq '^[0-9]+(,[0-9]+)*$' || { echo "dzr: nothing to play" >&2; return 1; }
+	# dzr-url exits 3 on a stale/expired session; call it directly (not via xargs, which
+	# would mangle the exit code to 123) so we can detect that and react (rebuild).
+	URLS=$($SELF-url "$IDS"); RC=$?
+	[ "$RC" = 3 ] && return 3
+	[ -z "$URLS" ] && { echo "dzr: nothing to play" >&2; return 1; }
+	printf '%s\n' "$URLS" | ${1:-cat} | while IFS= read -r line; do
 		printf '%s\n' "$line" | grep -q '	' || { echo "error: unexpected dzr-url output: $line" >&2; break; }
 		url=$(printf '%s\n' "$line" | cut -f1)
 		id=$(printf '%s\n' "$line" | cut -f2)
@@ -220,22 +235,23 @@ play() { # receive /track/1,2,3 from stdin
 }
 # play_all: call the gw fetcher for this context, extract track IDs, play
 play_all() { # $1=url $2=FUNC $3=order(cat|shuf)
-	ensure_session # refresh a stale (e.g. day-old) session before fetching/playing
+	# gw_data runs in the current shell so a stale-session rebuild persists into $GW_OUT.
 	case "$2" in
-	dzr_flow)           gw_flow ;;
-	dzr_loved)          gw_loved ;;
-	dzr_search_track)   gw_search_track "$1" ;;
-	dzr_artist_0_top)   gw_artist_top "$1" ;;
-	dzr_artist_0_radio) gw_artist_radio "$1" ;;
-	dzr_album_0)        gw_album "$1" ;;
-	dzr_playlist_0)     gw_playlist "$1" ;;
-	dzr_radio_0)        gw_radio "$1" ;;
+	dzr_flow)           gw_data gw_flow ;;
+	dzr_loved)          gw_data gw_loved ;;
+	dzr_search_track)   gw_data gw_search_track "$1" ;;
+	dzr_artist_0_top)   gw_data gw_artist_top "$1" ;;
+	dzr_artist_0_radio) gw_data gw_artist_radio "$1" ;;
+	dzr_album_0)        gw_data gw_album "$1" ;;
+	dzr_playlist_0)     gw_data gw_playlist "$1" ;;
+	dzr_radio_0)        gw_data gw_radio "$1" ;;
 	*) return 1 ;;
-	esac | jq "$GW_FMT_TRKS" | play "$3"
+	esac
+	printf "%s" "$GW_OUT" | jq "$GW_FMT_TRKS" | play "$3"
 }
 for url in "$@"; do
 	case $url in
-		/track/*) ensure_session; echo $url | play; continue ;; # direct play
+		/track/*) echo $url | play || { [ $? = 3 ] && build_session && echo $url | play; }; continue ;; # direct play (rebuild on stale)
 	esac
 
 	FUNC=$(echo "dzr_$url" | sed "$FMT_FUNC") # path (/search/artist?q=x) to function (dzr_search_artist)
@@ -250,7 +266,7 @@ for url in "$@"; do
 		case "$path" in
 		▸) play_all "$url" "$FUNC" cat; break ;;
 		⇄) play_all "$url" "$FUNC" shuf; break ;;
-		∞) while true; do ensure_session; gw_flow | jq "$GW_FMT_TRKS" | play cat || break; done; break ;;
+		∞) while gw_data gw_flow; printf "%s" "$GW_OUT" | jq "$GW_FMT_TRKS" | play cat; do :; done; break ;;
 		/*) $SELF "$path";;
 		*)  $SELF "$url/$path";;
 		esac
